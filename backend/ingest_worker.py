@@ -24,6 +24,7 @@ def _download(url: str) -> dict:
                 "preferredquality": "320",
             }
         ],
+        "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
     }

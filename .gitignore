@@ -219,5 +219,6 @@ __marimo__/
 
 # Crate Digger — local audio library
 backend/library/
+backend/suggestions_cache.json
 frontend/node_modules/
 frontend/.next/

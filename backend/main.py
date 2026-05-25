@@ -1,3 +1,4 @@
+import asyncio
 import os
 from pathlib import Path
 
@@ -8,6 +9,7 @@ from pydantic import BaseModel
 
 from ingest_worker import LIBRARY_DIR, ingest_url
 from mixer_engine import detect_bpm, mix_tracks, time_stretch_to_bpm
+from suggestions import get_suggestions
 
 app = FastAPI(title="Crate Digger API")
 
@@ -127,6 +129,25 @@ async def create_mix(req: MixRequest):
         filename="mix.wav",
         background=BackgroundTasks([_cleanup]),
     )
+
+
+@app.delete("/api/library")
+async def clear_library():
+    """Delete all MP3s from the library and wipe the in-memory cache."""
+    deleted = 0
+    for f in LIBRARY_DIR.glob("*.mp3"):
+        f.unlink()
+        deleted += 1
+    track_library.clear()
+    return {"status": "cleared", "deleted": deleted}
+
+
+@app.get("/api/suggestions")
+async def suggestions_endpoint():
+    """Return genre suggestions with yt-dlp-searched tracks. Cached 24h."""
+    loop = asyncio.get_event_loop()
+    result = await loop.run_in_executor(None, get_suggestions)
+    return {"suggestions": result}
 
 
 @app.get("/api/audio/{filename}")

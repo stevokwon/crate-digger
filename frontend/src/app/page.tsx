@@ -5,6 +5,10 @@ import WaveSurfer from "wavesurfer.js";
 
 const API = "http://localhost:8000";
 
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
 interface Track {
   id: string;
   filename: string;
@@ -13,98 +17,409 @@ interface Track {
   duration?: number | null;
 }
 
-interface DeckState {
-  track: Track | null;
-  isPlaying: boolean;
-  bpm: number | null;
+interface AudioNodes {
+  gain: GainNode;
+  low: BiquadFilterNode;
+  mid: BiquadFilterNode;
+  high: BiquadFilterNode;
+  sweep: BiquadFilterNode;
+}
+
+// ---------------------------------------------------------------------------
+// useDeck — owns the full audio graph for one deck
+// ---------------------------------------------------------------------------
+
+function useDeck(progressColor: string) {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const wsRef = useRef<WaveSurfer | null>(null);
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+  const ctxRef = useRef<AudioContext | null>(null);
+  const nodesRef = useRef<AudioNodes | null>(null);
+  const loopStartRef = useRef<number | null>(null);
+  const loopEndRef = useRef<number | null>(null);
+  const loopingRef = useRef(false);
+  const bpmRef = useRef<number | null>(null);
+
+  const [track, setTrack] = useState<Track | null>(null);
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [bpm, setBpmState] = useState<number | null>(null);
+  const [eqLow, setEqLow] = useState(0);
+  const [eqMid, setEqMid] = useState(0);
+  const [eqHigh, setEqHigh] = useState(0);
+  const [filterVal, setFilterValState] = useState(0.5);
+  const [volume, setVolumeState] = useState(1);
+  const [hotCues, setHotCues] = useState<(number | null)[]>([null, null, null]);
+  const [looping, setLooping] = useState(false);
+
+  useEffect(() => {
+    if (!containerRef.current) return;
+
+    // ---- Audio element ----
+    const audio = new Audio();
+    audio.crossOrigin = "anonymous";
+    audioRef.current = audio;
+
+    // Loop enforcement via timeupdate
+    audio.addEventListener("timeupdate", () => {
+      if (
+        loopingRef.current &&
+        loopStartRef.current !== null &&
+        loopEndRef.current !== null &&
+        audio.currentTime >= loopEndRef.current
+      ) {
+        audio.currentTime = loopStartRef.current;
+      }
+    });
+
+    // ---- Web Audio graph ----
+    const ctx = new AudioContext();
+    ctxRef.current = ctx;
+
+    const source = ctx.createMediaElementSource(audio);
+    const gain = ctx.createGain();
+
+    const low = ctx.createBiquadFilter();
+    low.type = "lowshelf";
+    low.frequency.value = 320;
+    low.gain.value = 0;
+
+    const mid = ctx.createBiquadFilter();
+    mid.type = "peaking";
+    mid.frequency.value = 1000;
+    mid.Q.value = 0.5;
+    mid.gain.value = 0;
+
+    const high = ctx.createBiquadFilter();
+    high.type = "highshelf";
+    high.frequency.value = 3200;
+    high.gain.value = 0;
+
+    const sweep = ctx.createBiquadFilter();
+    sweep.type = "lowpass";
+    sweep.frequency.value = 22050; // effectively open at center
+    sweep.Q.value = 0.7;
+
+    source
+      .connect(gain)
+      .connect(low)
+      .connect(mid)
+      .connect(high)
+      .connect(sweep)
+      .connect(ctx.destination);
+
+    nodesRef.current = { gain, low, mid, high, sweep };
+
+    // ---- WaveSurfer (uses our audio element for transport + viz) ----
+    const ws = WaveSurfer.create({
+      container: containerRef.current,
+      media: audio,
+      waveColor: "#3f3f46",
+      progressColor,
+      height: 80,
+      barWidth: 2,
+      barGap: 1,
+      interact: true,
+      normalize: true,
+    });
+
+    ws.on("finish", () => setIsPlaying(false));
+    wsRef.current = ws;
+
+    return () => {
+      ws.destroy();
+      ctx.close();
+      wsRef.current = null;
+      audioRef.current = null;
+    };
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const loadTrack = useCallback((t: Track) => {
+    ctxRef.current?.resume();
+    wsRef.current?.load(`${API}/api/audio/${t.filename}`);
+    setTrack(t);
+    setIsPlaying(false);
+    const b = t.bpm ?? null;
+    setBpmState(b);
+    bpmRef.current = b;
+    setHotCues([null, null, null]);
+    loopingRef.current = false;
+    setLooping(false);
+  }, []);
+
+  const setBpm = useCallback((val: number) => {
+    setBpmState(val);
+    bpmRef.current = val;
+  }, []);
+
+  const togglePlay = useCallback(() => {
+    ctxRef.current?.resume();
+    wsRef.current?.playPause();
+    setIsPlaying((p) => !p);
+  }, []);
+
+  const setLow = useCallback((db: number) => {
+    if (nodesRef.current) nodesRef.current.low.gain.value = db;
+    setEqLow(db);
+  }, []);
+
+  const setMid = useCallback((db: number) => {
+    if (nodesRef.current) nodesRef.current.mid.gain.value = db;
+    setEqMid(db);
+  }, []);
+
+  const setHigh = useCallback((db: number) => {
+    if (nodesRef.current) nodesRef.current.high.gain.value = db;
+    setEqHigh(db);
+  }, []);
+
+  const setFilter = useCallback((val: number) => {
+    setFilterValState(val);
+    const sw = nodesRef.current?.sweep;
+    if (!sw) return;
+    if (val <= 0.5) {
+      sw.type = "lowpass";
+      const t = val / 0.5; // 0→1
+      sw.frequency.value = 150 * Math.pow(22050 / 150, t); // 150Hz → 22kHz
+    } else {
+      sw.type = "highpass";
+      const t = (val - 0.5) / 0.5; // 0→1
+      sw.frequency.value = 20 * Math.pow(100, t); // 20Hz → 2000Hz
+    }
+  }, []);
+
+  const setVolume = useCallback((val: number) => {
+    if (nodesRef.current) nodesRef.current.gain.gain.value = val;
+    setVolumeState(val);
+  }, []);
+
+  const tapHotCue = useCallback(
+    (index: number) => {
+      const ws = wsRef.current;
+      const audio = audioRef.current;
+      if (!ws || !audio) return;
+      const cue = hotCues[index];
+      if (cue !== null) {
+        ws.setTime(cue);
+      } else {
+        const pos = audio.currentTime;
+        setHotCues((prev) => {
+          const next = [...prev];
+          next[index] = pos;
+          return next;
+        });
+      }
+    },
+    [hotCues]
+  );
+
+  const clearHotCue = useCallback((index: number) => {
+    setHotCues((prev) => {
+      const next = [...prev];
+      next[index] = null;
+      return next;
+    });
+  }, []);
+
+  const toggleLoop = useCallback(() => {
+    const audio = audioRef.current;
+    if (!audio) return;
+    if (loopingRef.current) {
+      loopingRef.current = false;
+      setLooping(false);
+    } else {
+      const start = audio.currentTime;
+      // 8 bars based on BPM, fallback to 8s
+      const bars = bpmRef.current ? (32 / bpmRef.current) * 60 : 8;
+      loopStartRef.current = start;
+      loopEndRef.current = start + bars;
+      loopingRef.current = true;
+      setLooping(true);
+    }
+  }, []);
+
+  return {
+    containerRef, wsRef,
+    track, isPlaying, bpm, setBpm,
+    eqLow, eqMid, eqHigh, filterVal, volume,
+    hotCues, looping,
+    loadTrack, togglePlay,
+    setLow, setMid, setHigh, setFilter, setVolume,
+    tapHotCue, clearHotCue, toggleLoop,
+  };
 }
 
 // ---------------------------------------------------------------------------
 // Deck component
 // ---------------------------------------------------------------------------
 
+const CUE_COLORS = ["#ef4444", "#eab308", "#22d3ee"];
+
 function Deck({
   label,
-  accentColor,
-  state,
-  waveRef,
-  bassEQ,
-  onTogglePlay,
-  onAnalyze,
-  onBassChange,
+  accentClass,
+  deck,
 }: {
   label: string;
-  accentColor: "emerald" | "violet";
-  state: DeckState;
-  waveRef: React.RefObject<HTMLDivElement | null>;
-  bassEQ: number;
-  onTogglePlay: () => void;
-  onAnalyze: () => void;
-  onBassChange: (v: number) => void;
+  accentClass: string;
+  deck: ReturnType<typeof useDeck>;
 }) {
-  const accent = accentColor === "emerald" ? "text-emerald-400" : "text-violet-400";
-  const accentBg =
-    accentColor === "emerald"
-      ? "bg-emerald-500/20 hover:bg-emerald-500/40 text-emerald-400"
-      : "bg-violet-500/20 hover:bg-violet-500/40 text-violet-400";
+  const {
+    containerRef, track, isPlaying, bpm,
+    eqLow, eqMid, eqHigh, filterVal, volume,
+    hotCues, looping,
+    togglePlay, setLow, setMid, setHigh, setFilter, setVolume,
+    tapHotCue, clearHotCue, toggleLoop,
+  } = deck;
+
+  const filterLabel = filterVal < 0.47 ? "LP" : filterVal > 0.53 ? "HP" : "OPEN";
 
   return (
-    <div className="flex-1 bg-zinc-900 rounded-xl p-4 flex flex-col gap-3 border border-zinc-800">
+    <div className="flex-1 flex flex-col gap-2.5 bg-zinc-900 rounded-xl p-3 border border-zinc-800 min-w-0">
       {/* Header */}
       <div className="flex items-center justify-between">
-        <span className="text-xs font-mono tracking-widest text-zinc-500 uppercase">{label}</span>
-        {state.bpm != null && (
-          <span className={`text-xs font-mono ${accent}`}>{state.bpm.toFixed(1)} BPM</span>
+        <span className={`text-xs font-mono tracking-widest uppercase ${accentClass}`}>{label}</span>
+        {bpm != null && (
+          <span className="text-xs font-mono text-zinc-400">{bpm.toFixed(1)} BPM</span>
         )}
       </div>
 
       {/* Waveform */}
-      <div
-        ref={waveRef}
-        className="h-24 bg-zinc-800 rounded-lg overflow-hidden"
-      />
+      <div ref={containerRef} className="h-20 bg-zinc-800 rounded-lg overflow-hidden" />
 
       {/* Track title */}
-      <p className="text-sm text-zinc-300 truncate h-5">
-        {state.track?.title ?? <span className="text-zinc-600">No track loaded</span>}
+      <p className="text-xs text-zinc-300 truncate min-h-[1rem]">
+        {track?.title ?? <span className="text-zinc-600 italic">No track loaded</span>}
       </p>
 
-      {/* Controls */}
-      <div className="flex gap-2">
+      {/* Transport row */}
+      <div className="flex gap-1.5">
         <button
-          onClick={onTogglePlay}
-          disabled={!state.track}
-          className="flex-1 py-2 rounded-lg bg-zinc-800 hover:bg-zinc-700 disabled:opacity-30 text-white text-xs font-mono tracking-wider transition-colors"
+          onClick={togglePlay}
+          disabled={!track}
+          className="flex-1 py-1.5 rounded-lg bg-zinc-800 hover:bg-zinc-700 disabled:opacity-30 text-white text-xs font-mono tracking-wider transition-colors"
         >
-          {state.isPlaying ? "PAUSE" : "PLAY"}
+          {isPlaying ? "⏸  PAUSE" : "▶  PLAY"}
         </button>
         <button
-          onClick={onAnalyze}
-          disabled={!state.track}
-          className={`px-4 py-2 rounded-lg text-xs font-mono transition-colors disabled:opacity-30 ${accentBg}`}
+          onClick={toggleLoop}
+          disabled={!track}
+          title="8-bar loop from current position"
+          className={`px-3 py-1.5 rounded-lg text-xs font-mono transition-colors disabled:opacity-30 ${
+            looping
+              ? "bg-amber-500 text-black font-bold"
+              : "bg-zinc-800 hover:bg-zinc-700 text-zinc-400"
+          }`}
         >
-          BPM
+          LOOP
         </button>
       </div>
 
-      {/* Bass EQ */}
-      <div className="flex items-center gap-3">
-        <span className="text-xs font-mono text-zinc-600 w-10 shrink-0">BASS</span>
-        <input
-          type="range"
-          min="0"
-          max="2"
-          step="0.01"
-          value={bassEQ}
-          onChange={(e) => onBassChange(parseFloat(e.target.value))}
-          className="flex-1"
-        />
-        <span className="text-xs font-mono text-zinc-500 w-10 text-right shrink-0">
-          {Math.round(bassEQ * 100)}%
-        </span>
+      {/* Hot cues */}
+      <div className="flex gap-1">
+        {hotCues.map((cue, i) => (
+          <div key={i} className="flex-1 flex gap-0.5 min-w-0">
+            <button
+              onClick={() => tapHotCue(i)}
+              disabled={!track}
+              title={cue !== null ? `Jump to ${cue.toFixed(1)}s` : "Set cue at current position"}
+              className="flex-1 py-1 rounded text-[10px] font-mono transition-all disabled:opacity-30 truncate"
+              style={{
+                backgroundColor: cue !== null ? CUE_COLORS[i] + "22" : "#27272a",
+                color: cue !== null ? CUE_COLORS[i] : "#52525b",
+                border: `1px solid ${cue !== null ? CUE_COLORS[i] + "55" : "transparent"}`,
+              }}
+            >
+              {cue !== null ? `${cue.toFixed(0)}s` : `CUE ${i + 1}`}
+            </button>
+            {cue !== null && (
+              <button
+                onClick={() => clearHotCue(i)}
+                className="px-1 rounded text-[10px] text-zinc-600 hover:text-red-400 transition-colors bg-zinc-800 shrink-0"
+              >
+                ✕
+              </button>
+            )}
+          </div>
+        ))}
+      </div>
+
+      {/* 3-Band EQ */}
+      <div className="border-t border-zinc-800 pt-2">
+        <p className="text-[9px] font-mono text-zinc-600 mb-1.5 tracking-widest">EQ</p>
+        <div className="grid grid-cols-3 gap-2">
+          {[
+            { label: "LOW", val: eqLow, set: setLow },
+            { label: "MID", val: eqMid, set: setMid },
+            { label: "HIGH", val: eqHigh, set: setHigh },
+          ].map(({ label: l, val, set }) => (
+            <div key={l} className="flex flex-col items-center gap-0.5">
+              <span className="text-[9px] font-mono text-zinc-500">{l}</span>
+              <input
+                type="range" min="-12" max="6" step="0.5" value={val}
+                onChange={(e) => set(parseFloat(e.target.value))}
+                className="w-full"
+              />
+              <span className="text-[9px] font-mono text-zinc-500">
+                {val > 0 ? "+" : ""}{val}dB
+              </span>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* Filter + Volume */}
+      <div className="border-t border-zinc-800 pt-2 grid grid-cols-2 gap-3">
+        <div className="flex flex-col gap-0.5">
+          <div className="flex justify-between items-center">
+            <span className="text-[9px] font-mono text-zinc-500">FILTER</span>
+            <span className={`text-[9px] font-mono ${
+              filterLabel === "OPEN" ? "text-zinc-600" : "text-amber-400"
+            }`}>{filterLabel}</span>
+          </div>
+          <input
+            type="range" min="0" max="1" step="0.01" value={filterVal}
+            onChange={(e) => setFilter(parseFloat(e.target.value))}
+            className="w-full"
+          />
+          <div className="flex justify-between">
+            <span className="text-[9px] text-zinc-700 font-mono">LP</span>
+            <span className="text-[9px] text-zinc-700 font-mono">HP</span>
+          </div>
+        </div>
+        <div className="flex flex-col gap-0.5">
+          <span className="text-[9px] font-mono text-zinc-500">VOLUME</span>
+          <input
+            type="range" min="0" max="1.5" step="0.01" value={volume}
+            onChange={(e) => setVolume(parseFloat(e.target.value))}
+            className="w-full"
+          />
+          <span className="text-[9px] font-mono text-zinc-500 text-right">
+            {Math.round(volume * 100)}%
+          </span>
+        </div>
       </div>
     </div>
   );
+}
+
+// ---------------------------------------------------------------------------
+// Suggestion types (from API)
+// ---------------------------------------------------------------------------
+
+interface SuggestionTrack {
+  title: string;
+  url: string;
+  duration?: number | null;
+}
+
+interface Suggestion {
+  id: string;
+  label: string;
+  technique: string;
+  tip: string;
+  color: string;
+  vibe: string;
+  tracks: SuggestionTrack[];
 }
 
 // ---------------------------------------------------------------------------
@@ -116,31 +431,26 @@ export default function Home() {
   const [ingestUrl, setIngestUrl] = useState("");
   const [ingesting, setIngesting] = useState(false);
   const [ingestError, setIngestError] = useState("");
-
-  const [deckA, setDeckA] = useState<DeckState>({ track: null, isPlaying: false, bpm: null });
-  const [deckB, setDeckB] = useState<DeckState>({ track: null, isPlaying: false, bpm: null });
   const [crossfader, setCrossfader] = useState(0.5);
-  const [bassA, setBassA] = useState(1.0);
-  const [bassB, setBassB] = useState(1.0);
   const [mixReady, setMixReady] = useState(false);
   const [mixing, setMixing] = useState(false);
+  const [showMixIdeas, setShowMixIdeas] = useState(false);
+  const [analyzingA, setAnalyzingA] = useState(false);
+  const [analyzingB, setAnalyzingB] = useState(false);
+  const [suggestions, setSuggestions] = useState<Suggestion[]>([]);
+  const [loadingSuggestions, setLoadingSuggestions] = useState(false);
+  const [diggingCard, setDiggingCard] = useState<Record<string, number>>({}); // id → count done
+  const suggestionsLoaded = useRef(false);
 
-  const waveContainerA = useRef<HTMLDivElement>(null);
-  const waveContainerB = useRef<HTMLDivElement>(null);
-  const wsA = useRef<WaveSurfer | null>(null);
-  const wsB = useRef<WaveSurfer | null>(null);
+  const deckA = useDeck("#34d399");
+  const deckB = useDeck("#a78bfa");
 
   // Poll track library
   const fetchTracks = useCallback(async () => {
     try {
       const res = await fetch(`${API}/api/tracks`);
-      if (res.ok) {
-        const data = await res.json();
-        setTracks(data.tracks);
-      }
-    } catch {
-      // Backend not ready yet — silent
-    }
+      if (res.ok) setTracks((await res.json()).tracks);
+    } catch { /* backend not ready */ }
   }, []);
 
   useEffect(() => {
@@ -149,77 +459,57 @@ export default function Home() {
     return () => clearInterval(id);
   }, [fetchTracks]);
 
-  // WaveSurfer A
+  // Fetch suggestions once when panel first opens (cached 24h on server)
   useEffect(() => {
-    if (!waveContainerA.current) return;
-    const ws = WaveSurfer.create({
-      container: waveContainerA.current,
-      waveColor: "#3f3f46",
-      progressColor: "#34d399",
-      height: 96,
-      barWidth: 2,
-      barGap: 1,
-      interact: true,
-      normalize: true,
-    });
-    ws.on("finish", () => setDeckA((d) => ({ ...d, isPlaying: false })));
-    wsA.current = ws;
-    return () => {
-      ws.destroy();
-      wsA.current = null;
-    };
+    if (!showMixIdeas || suggestionsLoaded.current) return;
+    setLoadingSuggestions(true);
+    fetch(`${API}/api/suggestions`)
+      .then((r) => r.json())
+      .then((d) => { setSuggestions(d.suggestions); suggestionsLoaded.current = true; })
+      .catch(() => {})
+      .finally(() => setLoadingSuggestions(false));
+  }, [showMixIdeas]);
+
+  const clearLibrary = useCallback(async () => {
+    if (!confirm("Delete all tracks from the library? This cannot be undone.")) return;
+    await fetch(`${API}/api/library`, { method: "DELETE" });
+    setTracks([]);
   }, []);
 
-  // WaveSurfer B
-  useEffect(() => {
-    if (!waveContainerB.current) return;
-    const ws = WaveSurfer.create({
-      container: waveContainerB.current,
-      waveColor: "#3f3f46",
-      progressColor: "#a78bfa",
-      height: 96,
-      barWidth: 2,
-      barGap: 1,
-      interact: true,
-      normalize: true,
-    });
-    ws.on("finish", () => setDeckB((d) => ({ ...d, isPlaying: false })));
-    wsB.current = ws;
-    return () => {
-      ws.destroy();
-      wsB.current = null;
-    };
-  }, []);
-
-  const loadTrack = useCallback((deck: "A" | "B", track: Track) => {
-    const ws = deck === "A" ? wsA.current : wsB.current;
-    const setter = deck === "A" ? setDeckA : setDeckB;
-    if (!ws) return;
-    ws.load(`${API}/api/audio/${track.filename}`);
-    setter({ track, isPlaying: false, bpm: track.bpm ?? null });
-    setMixReady(false);
-  }, []);
-
-  const togglePlay = useCallback((deck: "A" | "B") => {
-    const ws = deck === "A" ? wsA.current : wsB.current;
-    const setter = deck === "A" ? setDeckA : setDeckB;
-    if (!ws) return;
-    ws.playPause();
-    setter((d) => ({ ...d, isPlaying: !d.isPlaying }));
-  }, []);
+  const digSuggestion = useCallback(async (suggestion: Suggestion) => {
+    const tracks = suggestion.tracks.slice(0, 5);
+    setDiggingCard((prev) => ({ ...prev, [suggestion.id]: 0 }));
+    for (let i = 0; i < tracks.length; i++) {
+      await fetch(`${API}/api/ingest`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ url: tracks[i].url }),
+      }).catch(() => {});
+      setDiggingCard((prev) => ({ ...prev, [suggestion.id]: i + 1 }));
+    }
+    // Remove progress indicator after a moment, then refresh crate
+    setTimeout(() => {
+      setDiggingCard((prev) => { const n = { ...prev }; delete n[suggestion.id]; return n; });
+      fetchTracks();
+    }, 1500);
+    setTimeout(fetchTracks, 8000);
+  }, [fetchTracks]);
 
   const analyzeBpm = useCallback(
     async (deck: "A" | "B") => {
-      const state = deck === "A" ? deckA : deckB;
-      const setter = deck === "A" ? setDeckA : setDeckB;
-      if (!state.track) return;
-      const res = await fetch(`${API}/api/analyze/${state.track.id}`, { method: "POST" });
-      if (!res.ok) return;
-      const data = await res.json();
-      setter((d) => ({ ...d, bpm: data.bpm }));
-      setTracks((prev) =>
-        prev.map((t) => (t.id === state.track!.id ? { ...t, bpm: data.bpm } : t))
-      );
+      const d = deck === "A" ? deckA : deckB;
+      if (!d.track) return;
+      const setAnalyzing = deck === "A" ? setAnalyzingA : setAnalyzingB;
+      setAnalyzing(true);
+      try {
+        const res = await fetch(`${API}/api/analyze/${d.track.id}`, { method: "POST" });
+        if (!res.ok) return;
+        const data = await res.json();
+        d.setBpm(data.bpm);
+        setTracks((prev) => prev.map((t) => (t.id === d.track!.id ? { ...t, bpm: data.bpm } : t)));
+      } finally {
+        setAnalyzing(false);
+      }
     },
     [deckA, deckB]
   );
@@ -227,7 +517,7 @@ export default function Home() {
   const handleSync = useCallback(async () => {
     if (!deckA.track || !deckB.track || mixing) return;
     if (!deckA.bpm || !deckB.bpm) {
-      alert("Analyze BPM on both decks first, then SYNC.");
+      alert("Hit BPM on both decks first.");
       return;
     }
     setMixing(true);
@@ -239,8 +529,8 @@ export default function Home() {
           deck_a: deckA.track.id,
           deck_b: deckB.track.id,
           crossfader,
-          eq_bass_a: bassA,
-          eq_bass_b: bassB,
+          eq_bass_a: 1,
+          eq_bass_b: 1,
           target_bpm: deckA.bpm,
         }),
       });
@@ -248,17 +538,15 @@ export default function Home() {
       const blob = await res.blob();
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
-      a.href = url;
-      a.download = "mix.wav";
-      a.click();
+      a.href = url; a.download = "mix.wav"; a.click();
       URL.revokeObjectURL(url);
       setMixReady(true);
     } catch (e) {
-      alert(`Mix failed: ${e instanceof Error ? e.message : "unknown error"}`);
+      alert(`Mix failed: ${e instanceof Error ? e.message : "unknown"}`);
     } finally {
       setMixing(false);
     }
-  }, [deckA, deckB, crossfader, bassA, bassB, mixing]);
+  }, [deckA, deckB, crossfader, mixing]);
 
   const handleIngest = useCallback(async () => {
     if (!ingestUrl || ingesting) return;
@@ -272,9 +560,8 @@ export default function Home() {
       });
       if (!res.ok) throw new Error(await res.text());
       setIngestUrl("");
-      // Give yt-dlp time to download, then refresh
       setTimeout(fetchTracks, 4000);
-      setTimeout(fetchTracks, 10000);
+      setTimeout(fetchTracks, 12000);
     } catch (e) {
       setIngestError(e instanceof Error ? e.message : "Ingest failed");
     } finally {
@@ -283,143 +570,202 @@ export default function Home() {
   }, [ingestUrl, ingesting, fetchTracks]);
 
   return (
-    <main className="h-screen flex flex-col overflow-hidden bg-zinc-950">
+    <main className="h-screen flex flex-col overflow-hidden bg-zinc-950 text-white">
       {/* Header */}
-      <header className="flex items-center gap-3 px-6 py-3 border-b border-zinc-800 shrink-0">
-        <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
-        <span className="text-xs font-mono tracking-[0.25em] text-zinc-400 uppercase">
-          Crate Digger
-        </span>
+      <header className="flex items-center gap-3 px-5 py-2.5 border-b border-zinc-800 shrink-0">
+        <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
+        <span className="text-xs font-mono tracking-[0.3em] text-zinc-400 uppercase">Crate Digger</span>
+        <div className="flex-1" />
+        <button
+          onClick={() => setShowMixIdeas((v) => !v)}
+          className={`text-xs font-mono px-3 py-1 rounded-lg transition-colors ${
+            showMixIdeas
+              ? "bg-zinc-700 text-white"
+              : "bg-zinc-800 hover:bg-zinc-700 text-zinc-400"
+          }`}
+        >
+          {showMixIdeas ? "HIDE IDEAS" : "MIX IDEAS"}
+        </button>
       </header>
 
       <div className="flex flex-1 overflow-hidden">
-        {/* ---- Crate Panel ---- */}
-        <aside className="w-64 flex flex-col border-r border-zinc-800 shrink-0">
-          {/* Ingest form */}
-          <div className="p-3 border-b border-zinc-800">
-            <div className="flex gap-2">
+        {/* ---- Crate ---- */}
+        <aside className="w-56 flex flex-col border-r border-zinc-800 shrink-0">
+          <div className="p-2.5 border-b border-zinc-800 space-y-2">
+            <div className="flex gap-1.5">
               <input
                 type="text"
                 value={ingestUrl}
                 onChange={(e) => setIngestUrl(e.target.value)}
                 onKeyDown={(e) => e.key === "Enter" && handleIngest()}
-                placeholder="SoundCloud / Bandcamp URL"
-                className="flex-1 min-w-0 bg-zinc-800 text-xs text-zinc-300 px-3 py-2 rounded-lg outline-none placeholder-zinc-600 border border-zinc-700 focus:border-zinc-500 transition-colors"
+                placeholder="SoundCloud URL..."
+                className="flex-1 min-w-0 bg-zinc-800 text-xs text-zinc-300 px-2.5 py-1.5 rounded-lg outline-none placeholder-zinc-600 border border-zinc-700 focus:border-zinc-500 transition-colors"
               />
               <button
                 onClick={handleIngest}
                 disabled={ingesting || !ingestUrl}
-                className="px-3 py-2 bg-emerald-500 hover:bg-emerald-400 disabled:opacity-40 text-black text-xs font-mono rounded-lg transition-colors shrink-0"
+                className="px-2.5 py-1.5 bg-emerald-500 hover:bg-emerald-400 disabled:opacity-40 text-black text-xs font-mono rounded-lg transition-colors shrink-0"
               >
                 {ingesting ? "..." : "DIG"}
               </button>
             </div>
-            {ingestError && (
-              <p className="text-xs text-red-400 mt-2 font-mono">{ingestError}</p>
-            )}
+            {ingestError && <p className="text-[10px] text-red-400 font-mono">{ingestError}</p>}
           </div>
 
-          {/* Track list */}
           <div className="flex-1 overflow-y-auto">
             {tracks.length === 0 ? (
-              <p className="text-xs text-zinc-600 p-4 font-mono leading-relaxed">
-                No tracks yet.
-                <br />
-                Paste a URL above.
+              <p className="text-[11px] text-zinc-600 p-3 font-mono leading-relaxed">
+                Crate is empty.<br />Paste a URL above.
               </p>
             ) : (
-              tracks.map((track) => (
-                <div
-                  key={track.id}
-                  className="group px-3 py-2.5 hover:bg-zinc-800/60 border-b border-zinc-800/50 transition-colors"
+              <>
+              <div className="px-3 py-2 border-b border-zinc-800/60 flex items-center justify-between">
+                <span className="text-[10px] font-mono text-zinc-600">{tracks.length} tracks</span>
+                <button
+                  onClick={clearLibrary}
+                  className="text-[10px] font-mono text-zinc-600 hover:text-red-400 transition-colors"
                 >
-                  <p className="text-xs text-zinc-300 truncate leading-snug">{track.title}</p>
+                  CLEAR ALL
+                </button>
+              </div>
+              {tracks.map((track) => (
+                <div key={track.id} className="group px-3 py-2 hover:bg-zinc-800/60 border-b border-zinc-800/40 transition-colors">
+                  <p className="text-[11px] text-zinc-300 truncate leading-snug">{track.title}</p>
                   {track.bpm != null && (
-                    <p className="text-xs text-zinc-600 font-mono mt-0.5">{track.bpm.toFixed(1)} BPM</p>
+                    <p className="text-[10px] text-zinc-600 font-mono mt-0.5">{track.bpm.toFixed(1)} BPM</p>
                   )}
-                  <div className="flex gap-1.5 mt-1.5 opacity-0 group-hover:opacity-100 transition-opacity">
-                    <button
-                      onClick={() => loadTrack("A", track)}
-                      className="text-xs px-2.5 py-0.5 rounded bg-emerald-500/20 hover:bg-emerald-500/40 text-emerald-400 font-mono transition-colors"
-                    >
+                  <div className="flex gap-1 mt-1 opacity-0 group-hover:opacity-100 transition-opacity">
+                    <button onClick={() => deckA.loadTrack(track)}
+                      className="text-[10px] px-2 py-0.5 rounded bg-emerald-500/20 hover:bg-emerald-500/40 text-emerald-400 font-mono transition-colors">
                       A
                     </button>
-                    <button
-                      onClick={() => loadTrack("B", track)}
-                      className="text-xs px-2.5 py-0.5 rounded bg-violet-500/20 hover:bg-violet-500/40 text-violet-400 font-mono transition-colors"
-                    >
+                    <button onClick={() => deckB.loadTrack(track)}
+                      className="text-[10px] px-2 py-0.5 rounded bg-violet-500/20 hover:bg-violet-500/40 text-violet-400 font-mono transition-colors">
                       B
                     </button>
                   </div>
                 </div>
-              ))
+              ))}
+              </>
             )}
           </div>
         </aside>
 
-        {/* ---- Mixer ---- */}
-        <div className="flex-1 flex flex-col p-5 gap-4 overflow-hidden">
-          {/* Decks row */}
-          <div className="flex gap-4 flex-1">
-            <Deck
-              label="Deck A"
-              accentColor="emerald"
-              state={deckA}
-              waveRef={waveContainerA}
-              bassEQ={bassA}
-              onTogglePlay={() => togglePlay("A")}
-              onAnalyze={() => analyzeBpm("A")}
-              onBassChange={setBassA}
-            />
+        {/* ---- Main mixer area ---- */}
+        <div className="flex-1 flex flex-col overflow-hidden">
+
+          {/* Mix Ideas Panel */}
+          {showMixIdeas && (
+            <div className="border-b border-zinc-800 bg-zinc-900/60 overflow-x-auto shrink-0">
+              {loadingSuggestions ? (
+                <div className="flex items-center gap-2 p-4">
+                  <span className="w-1.5 h-1.5 rounded-full bg-zinc-500 animate-pulse" />
+                  <span className="text-xs font-mono text-zinc-500">Searching for current tracks...</span>
+                </div>
+              ) : (
+                <div className="flex gap-3 p-3 w-max">
+                  {suggestions.map((s) => {
+                    const digging = diggingCard[s.id];
+                    const isDone = digging === 5;
+                    return (
+                      <div key={s.id}
+                        className="w-60 shrink-0 rounded-xl border border-zinc-700 bg-zinc-900 p-3 flex flex-col gap-2">
+                        {/* Header */}
+                        <div className="flex items-start justify-between gap-2">
+                          <span className="text-[10px] font-mono font-bold text-white leading-snug">{s.label}</span>
+                          <span className="text-[9px] px-1.5 py-0.5 rounded font-mono shrink-0 mt-0.5"
+                            style={{ backgroundColor: s.color + "22", color: s.color }}>
+                            {s.technique}
+                          </span>
+                        </div>
+                        {/* Tip */}
+                        <p className="text-[10px] text-zinc-400 leading-relaxed">{s.tip}</p>
+                        {/* Track list */}
+                        {s.tracks.length > 0 && (
+                          <div className="border-t border-zinc-800 pt-2 flex flex-col gap-1">
+                            <p className="text-[9px] font-mono text-zinc-600 mb-0.5">NOW TRENDING:</p>
+                            {s.tracks.slice(0, 5).map((t, i) => (
+                              <p key={i} className="text-[10px] text-zinc-400 truncate leading-snug">
+                                <span className="text-zinc-600 font-mono mr-1">{i + 1}.</span>{t.title}
+                              </p>
+                            ))}
+                          </div>
+                        )}
+                        {/* Footer */}
+                        <div className="mt-auto pt-2 border-t border-zinc-800 flex items-center justify-between">
+                          <span className="text-[9px] font-mono" style={{ color: s.color }}>
+                            {s.vibe}
+                          </span>
+                          <button
+                            onClick={() => !digging && !isDone && digSuggestion(s)}
+                            disabled={digging !== undefined || s.tracks.length === 0}
+                            className="text-[9px] font-mono px-2 py-1 rounded transition-colors disabled:opacity-40"
+                            style={{
+                              backgroundColor: isDone ? s.color + "33" : s.color + "22",
+                              color: s.color,
+                            }}
+                          >
+                            {isDone ? "DIGGED ✓"
+                              : digging !== undefined ? `${digging}/5...`
+                              : "DIG THESE"}
+                          </button>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Decks + center controls */}
+          <div className="flex gap-3 flex-1 p-3 overflow-hidden min-h-0">
+            <Deck label="DECK A" accentClass="text-emerald-400" deck={deckA} />
 
             {/* Center column */}
-            <div className="w-28 flex flex-col items-center justify-center gap-5 shrink-0">
+            <div className="w-24 flex flex-col items-center justify-center gap-3 shrink-0">
+              <button
+                onClick={() => analyzeBpm("A")}
+                disabled={!deckA.track || analyzingA}
+                className="w-full py-2 rounded-lg bg-zinc-800 hover:bg-zinc-700 disabled:opacity-30 text-emerald-400 text-[10px] font-mono transition-colors"
+              >
+                {analyzingA ? "..." : "BPM A"}
+              </button>
               <button
                 onClick={handleSync}
                 disabled={mixing || !deckA.track || !deckB.track}
                 className={`w-full py-3 rounded-xl text-xs font-mono tracking-widest transition-all disabled:opacity-30 ${
-                  mixing
-                    ? "bg-zinc-700 text-zinc-400 animate-pulse"
-                    : mixReady
-                    ? "bg-emerald-500 text-black"
-                    : "bg-zinc-800 hover:bg-zinc-700 text-zinc-300"
+                  mixing ? "bg-zinc-700 text-zinc-400 animate-pulse"
+                  : mixReady ? "bg-emerald-500 text-black"
+                  : "bg-zinc-800 hover:bg-zinc-700 text-zinc-300"
                 }`}
               >
-                {mixing ? "MIXING" : "SYNC"}
+                {mixing ? "..." : "SYNC"}
               </button>
-              <p className="text-xs font-mono text-zinc-600 tracking-widest">XFADE</p>
+              <button
+                onClick={() => analyzeBpm("B")}
+                disabled={!deckB.track || analyzingB}
+                className="w-full py-2 rounded-lg bg-zinc-800 hover:bg-zinc-700 disabled:opacity-30 text-violet-400 text-[10px] font-mono transition-colors"
+              >
+                {analyzingB ? "..." : "BPM B"}
+              </button>
             </div>
 
-            <Deck
-              label="Deck B"
-              accentColor="violet"
-              state={deckB}
-              waveRef={waveContainerB}
-              bassEQ={bassB}
-              onTogglePlay={() => togglePlay("B")}
-              onAnalyze={() => analyzeBpm("B")}
-              onBassChange={setBassB}
-            />
+            <Deck label="DECK B" accentClass="text-violet-400" deck={deckB} />
           </div>
 
           {/* Crossfader */}
-          <div className="crossfader bg-zinc-900 rounded-xl px-5 py-4 border border-zinc-800 shrink-0">
+          <div className="crossfader px-5 py-3 border-t border-zinc-800 shrink-0 bg-zinc-900/40">
             <div className="flex items-center gap-4">
               <span className="text-xs font-mono text-emerald-400 shrink-0">A</span>
               <input
-                type="range"
-                min="0"
-                max="1"
-                step="0.01"
-                value={crossfader}
-                onChange={(e) => {
-                  setCrossfader(parseFloat(e.target.value));
-                  setMixReady(false);
-                }}
+                type="range" min="0" max="1" step="0.01" value={crossfader}
+                onChange={(e) => { setCrossfader(parseFloat(e.target.value)); setMixReady(false); }}
                 className="flex-1"
               />
               <span className="text-xs font-mono text-violet-400 shrink-0">B</span>
             </div>
+            <p className="text-center text-[9px] font-mono text-zinc-700 mt-1 tracking-widest">CROSSFADER</p>
           </div>
         </div>
       </div>
