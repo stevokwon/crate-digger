@@ -6,6 +6,116 @@ import WaveSurfer from "wavesurfer.js";
 const API = "http://localhost:8000";
 
 // ---------------------------------------------------------------------------
+// IndexedDB helpers — persist FileSystemDirectoryHandle across sessions
+// ---------------------------------------------------------------------------
+
+const IDB_DB = "crate-digger";
+const IDB_STORE = "settings";
+const IDB_KEY = "outputDir";
+
+function openIDB(): Promise<IDBDatabase> {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(IDB_DB, 1);
+    req.onupgradeneeded = () => req.result.createObjectStore(IDB_STORE);
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function idbPut(value: unknown) {
+  const db = await openIDB();
+  return new Promise<void>((resolve, reject) => {
+    const tx = db.transaction(IDB_STORE, "readwrite");
+    tx.objectStore(IDB_STORE).put(value, IDB_KEY);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+async function idbGet<T>(): Promise<T | null> {
+  try {
+    const db = await openIDB();
+    return new Promise((resolve) => {
+      const tx = db.transaction(IDB_STORE, "readonly");
+      const req = tx.objectStore(IDB_STORE).get(IDB_KEY);
+      req.onsuccess = () => resolve((req.result as T) ?? null);
+      req.onerror = () => resolve(null);
+    });
+  } catch {
+    return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// useOutputDir — File System Access API with IndexedDB persistence
+// ---------------------------------------------------------------------------
+
+function useOutputDir() {
+  const [handle, setHandle] = useState<FileSystemDirectoryHandle | null>(null);
+  const [dirName, setDirName] = useState<string | null>(null);
+  const [supported] = useState(
+    () => typeof window !== "undefined" && "showDirectoryPicker" in window
+  );
+  const [showSetup, setShowSetup] = useState(false);
+
+  // Restore saved handle on mount
+  useEffect(() => {
+    if (!supported) return;
+    idbGet<FileSystemDirectoryHandle>().then(async (h) => {
+      if (!h) {
+        setShowSetup(true); // first visit — prompt setup
+        return;
+      }
+      // Verify we still have permission (may have been revoked)
+      try {
+        // queryPermission / requestPermission are File System Access API extensions
+        // not yet in TypeScript's lib.dom.d.ts — cast to any
+        const perm = await (h as any).queryPermission({ mode: "readwrite" });
+        if (perm === "granted") {
+          setHandle(h);
+          setDirName(h.name);
+        } else {
+          setShowSetup(true);
+        }
+      } catch {
+        setShowSetup(true);
+      }
+    });
+  }, [supported]);
+
+  const pickDir = useCallback(async () => {
+    if (!supported) return;
+    try {
+      const h = await (window as unknown as { showDirectoryPicker: (o?: object) => Promise<FileSystemDirectoryHandle> })
+        .showDirectoryPicker({ mode: "readwrite" });
+      await idbPut(h);
+      setHandle(h);
+      setDirName(h.name);
+      setShowSetup(false);
+    } catch {
+      // user cancelled — keep existing state
+    }
+  }, [supported]);
+
+  const saveFile = useCallback(async (blob: Blob, filename: string): Promise<boolean> => {
+    if (!handle) return false;
+    try {
+      const perm = await (handle as any).requestPermission({ mode: "readwrite" });
+      if (perm !== "granted") return false;
+      const fh = await handle.getFileHandle(filename, { create: true });
+      const writable = await fh.createWritable();
+      await writable.write(blob);
+      await writable.close();
+      return true;
+    } catch {
+      return false;
+    }
+  }, [handle]);
+
+  return { supported, handle, dirName, showSetup, setShowSetup, pickDir, saveFile };
+}
+
+// ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
 
@@ -442,6 +552,8 @@ export default function Home() {
   const [diggingCard, setDiggingCard] = useState<Record<string, number>>({}); // id → count done
   const suggestionsLoaded = useRef(false);
 
+  const outputDir = useOutputDir();
+
   const deckA = useDeck("#34d399");
   const deckB = useDeck("#a78bfa");
 
@@ -536,10 +648,15 @@ export default function Home() {
       });
       if (!res.ok) throw new Error(await res.text());
       const blob = await res.blob();
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url; a.download = "mix.wav"; a.click();
-      URL.revokeObjectURL(url);
+      const filename = `mix-${Date.now()}.wav`;
+      // Try saving to chosen output directory first; fall back to browser download
+      const saved = await outputDir.saveFile(blob, filename);
+      if (!saved) {
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url; a.download = filename; a.click();
+        URL.revokeObjectURL(url);
+      }
       setMixReady(true);
     } catch (e) {
       alert(`Mix failed: ${e instanceof Error ? e.message : "unknown"}`);
@@ -571,11 +688,52 @@ export default function Home() {
 
   return (
     <main className="h-screen flex flex-col overflow-hidden bg-zinc-950 text-white">
+
+      {/* Output dir setup modal — shown on first visit or when no dir is set */}
+      {outputDir.showSetup && outputDir.supported && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm">
+          <div className="bg-zinc-900 border border-zinc-700 rounded-2xl p-8 max-w-sm w-full mx-4 flex flex-col gap-5">
+            <div>
+              <h2 className="text-sm font-mono font-bold text-white tracking-wide mb-1">
+                Where should mixes be saved?
+              </h2>
+              <p className="text-xs text-zinc-400 leading-relaxed">
+                Pick a folder on your computer. Every mix you export will land there automatically — no more hunting through Downloads.
+              </p>
+            </div>
+            <button
+              onClick={outputDir.pickDir}
+              className="w-full py-3 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-black text-xs font-mono tracking-widest transition-colors"
+            >
+              CHOOSE FOLDER
+            </button>
+            <button
+              onClick={() => outputDir.setShowSetup(false)}
+              className="text-[10px] font-mono text-zinc-600 hover:text-zinc-400 transition-colors text-center"
+            >
+              Skip — use browser Downloads for now
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* Header */}
       <header className="flex items-center gap-3 px-5 py-2.5 border-b border-zinc-800 shrink-0">
         <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
         <span className="text-xs font-mono tracking-[0.3em] text-zinc-400 uppercase">Crate Digger</span>
         <div className="flex-1" />
+        {/* Output dir indicator */}
+        {outputDir.supported && (
+          <button
+            onClick={outputDir.pickDir}
+            className="flex items-center gap-1.5 text-[10px] font-mono px-2.5 py-1 rounded-lg bg-zinc-800 hover:bg-zinc-700 transition-colors"
+            title="Change mix output folder"
+          >
+            <span className={outputDir.dirName ? "text-emerald-400" : "text-zinc-600"}>
+              {outputDir.dirName ? `→ ${outputDir.dirName}` : "SET OUTPUT FOLDER"}
+            </span>
+          </button>
+        )}
         <button
           onClick={() => setShowMixIdeas((v) => !v)}
           className={`text-xs font-mono px-3 py-1 rounded-lg transition-colors ${
