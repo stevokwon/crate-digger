@@ -1,0 +1,137 @@
+import os
+from pathlib import Path
+
+from fastapi import BackgroundTasks, FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from pydantic import BaseModel
+
+from ingest_worker import LIBRARY_DIR, ingest_url
+from mixer_engine import detect_bpm, mix_tracks, time_stretch_to_bpm
+
+app = FastAPI(title="Crate Digger API")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# In-memory BPM cache: { track_id: { bpm, title, filename, duration } }
+track_library: dict[str, dict] = {}
+
+
+# ---------------------------------------------------------------------------
+# Request models
+# ---------------------------------------------------------------------------
+
+
+class IngestRequest(BaseModel):
+    url: str
+
+
+class MixRequest(BaseModel):
+    deck_a: str
+    deck_b: str
+    crossfader: float = 0.5
+    eq_bass_a: float = 1.0
+    eq_bass_b: float = 1.0
+    target_bpm: float | None = None
+
+
+# ---------------------------------------------------------------------------
+# Endpoints
+# ---------------------------------------------------------------------------
+
+
+@app.get("/api/tracks")
+async def list_tracks():
+    tracks = []
+    for f in sorted(LIBRARY_DIR.glob("*.mp3"), key=lambda p: p.stat().st_mtime, reverse=True):
+        track_id = f.stem
+        cached = track_library.get(track_id, {})
+        tracks.append(
+            {
+                "id": track_id,
+                "filename": f.name,
+                "title": cached.get("title", track_id),
+                "bpm": cached.get("bpm"),
+                "duration": cached.get("duration"),
+            }
+        )
+    return {"tracks": tracks}
+
+
+@app.post("/api/ingest")
+async def ingest_track(req: IngestRequest, bg: BackgroundTasks):
+    async def _task():
+        try:
+            result = await ingest_url(req.url)
+            track_library[result["id"]] = result
+        except Exception as e:
+            print(f"[ingest error] {req.url}: {e}")
+
+    bg.add_task(_task)
+    return {"status": "ingesting", "url": req.url}
+
+
+@app.post("/api/analyze/{track_id}")
+async def analyze_track(track_id: str):
+    filepath = LIBRARY_DIR / f"{track_id}.mp3"
+    if not filepath.exists():
+        raise HTTPException(status_code=404, detail=f"Track '{track_id}' not found in library")
+
+    bpm = detect_bpm(str(filepath))
+    track_library.setdefault(track_id, {})["bpm"] = bpm
+    return {"track_id": track_id, "bpm": bpm}
+
+
+@app.post("/api/mix")
+async def create_mix(req: MixRequest):
+    path_a = LIBRARY_DIR / f"{req.deck_a}.mp3"
+    path_b = LIBRARY_DIR / f"{req.deck_b}.mp3"
+
+    if not path_a.exists():
+        raise HTTPException(status_code=404, detail=f"Deck A track '{req.deck_a}' not found")
+    if not path_b.exists():
+        raise HTTPException(status_code=404, detail=f"Deck B track '{req.deck_b}' not found")
+
+    a_path = str(path_a)
+    b_path = str(path_b)
+    tmp_files: list[str] = []
+
+    if req.target_bpm:
+        bpm_a = track_library.get(req.deck_a, {}).get("bpm") or detect_bpm(a_path)
+        bpm_b = track_library.get(req.deck_b, {}).get("bpm") or detect_bpm(b_path)
+
+        if abs(bpm_a - req.target_bpm) > 0.5:
+            a_path = time_stretch_to_bpm(a_path, bpm_a, req.target_bpm)
+            tmp_files.append(a_path)
+        if abs(bpm_b - req.target_bpm) > 0.5:
+            b_path = time_stretch_to_bpm(b_path, bpm_b, req.target_bpm)
+            tmp_files.append(b_path)
+
+    mix_path = mix_tracks(a_path, b_path, req.crossfader, req.eq_bass_a, req.eq_bass_b)
+
+    def _cleanup():
+        for f in [*tmp_files, mix_path]:
+            try:
+                os.unlink(f)
+            except OSError:
+                pass
+
+    return FileResponse(
+        mix_path,
+        media_type="audio/wav",
+        filename="mix.wav",
+        background=BackgroundTasks([_cleanup]),
+    )
+
+
+@app.get("/api/audio/{filename}")
+async def serve_audio(filename: str):
+    filepath = LIBRARY_DIR / filename
+    if not filepath.exists():
+        raise HTTPException(status_code=404, detail="Audio file not found")
+    return FileResponse(str(filepath))

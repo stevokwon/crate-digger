@@ -216,3 +216,8 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Crate Digger — local audio library
+backend/library/
+frontend/node_modules/
+frontend/.next/
