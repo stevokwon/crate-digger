@@ -2,6 +2,8 @@
 
 A browser-based open-format DJ mixer built for learning to mix. Dig tracks from YouTube and SoundCloud, mix them live on two decks with real-time EQ, filter sweeps, BPM matching, auto-blend, and one-click recording — all without leaving the browser.
 
+![Main mixer UI](assets/home_ui.png)
+
 ---
 
 ## Requirements
@@ -49,6 +51,8 @@ Hit **CLEAR ALL** at the top of the crate to delete all downloaded MP3s from the
 ### Mix Ideas panel
 
 Open via **MIX IDEAS** in the header. Shows five genre cards refreshed daily via a YouTube search cache:
+
+![Mix Ideas panel](assets/idea_section.png)
 
 | Genre | Mixing technique |
 |-------|-----------------|
