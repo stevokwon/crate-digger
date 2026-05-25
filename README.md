@@ -33,6 +33,47 @@ npm run dev        # http://localhost:3000
 
 ---
 
+## Deploying publicly (free tier)
+
+The frontend deploys to **Vercel** (free forever) and the backend to **Render** (free tier — sleeps after 15 min idle, ~30 s cold-start on first request).
+
+### 1 — Deploy the backend to Render
+
+1. Go to [render.com](https://render.com) → **New → Web Service**
+2. Connect your GitHub repo
+3. Set **Root Directory** to `backend`
+4. Set **Runtime** to **Docker** (Render will use `backend/Dockerfile`)
+5. Add the environment variable:
+
+   | Key | Value |
+   |-----|-------|
+   | `CORS_ORIGINS` | `https://your-app.vercel.app` *(fill in after step 2)* |
+
+6. Click **Deploy**. Once live, copy the service URL (e.g. `https://crate-digger-api.onrender.com`)
+
+### 2 — Deploy the frontend to Vercel
+
+1. Go to [vercel.com](https://vercel.com) → **Add New Project** → import this repo
+2. Set **Root Directory** to `frontend`
+3. Add the environment variable:
+
+   | Key | Value |
+   |-----|-------|
+   | `NEXT_PUBLIC_API_URL` | `https://crate-digger-api.onrender.com` *(your Render URL)* |
+
+4. Click **Deploy**. Copy the Vercel URL and paste it back into Render's `CORS_ORIGINS` env var, then redeploy the backend.
+
+### Known free-tier limitations
+
+| Issue | Detail |
+|-------|--------|
+| Cold starts | Render free instances sleep after 15 min idle. First request after sleep takes ~30 s. |
+| Memory | Render free gives 512 MB RAM. BPM detection and mixing on long tracks (1-hour mixes) may hit this limit. Shorter tracks (< 10 min) work fine. |
+| Ephemeral storage | Downloaded tracks are lost on each redeploy or restart. Users need to re-dig tracks after a server restart. |
+| YouTube blocking | Cloud server IPs are sometimes blocked by YouTube's rate-limiter. SoundCloud URLs tend to be more reliable on hosted servers. |
+
+---
+
 ## Features
 
 ### Crate — finding and managing tracks
