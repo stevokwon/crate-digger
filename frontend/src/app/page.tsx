@@ -53,10 +53,12 @@ async function idbGet<T>(): Promise<T | null> {
 function useOutputDir() {
   const [handle, setHandle] = useState<FileSystemDirectoryHandle | null>(null);
   const [dirName, setDirName] = useState<string | null>(null);
-  const [supported] = useState(
-    () => typeof window !== "undefined" && "showDirectoryPicker" in window
-  );
+  const [supported, setSupported] = useState(false);
   const [showSetup, setShowSetup] = useState(false);
+
+  useEffect(() => {
+    setSupported("showDirectoryPicker" in window);
+  }, []);
 
   // Restore saved handle on mount
   useEffect(() => {
@@ -133,6 +135,7 @@ interface AudioNodes {
   mid: BiquadFilterNode;
   high: BiquadFilterNode;
   sweep: BiquadFilterNode;
+  crossfadeGain: GainNode;
 }
 
 // ---------------------------------------------------------------------------
@@ -145,6 +148,7 @@ function useDeck(progressColor: string) {
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const ctxRef = useRef<AudioContext | null>(null);
   const nodesRef = useRef<AudioNodes | null>(null);
+  const mediaStreamDestRef = useRef<MediaStreamAudioDestinationNode | null>(null);
   const loopStartRef = useRef<number | null>(null);
   const loopEndRef = useRef<number | null>(null);
   const loopingRef = useRef(false);
@@ -209,15 +213,25 @@ function useDeck(progressColor: string) {
     sweep.frequency.value = 22050; // effectively open at center
     sweep.Q.value = 0.7;
 
+    const crossfadeGain = ctx.createGain();
+    crossfadeGain.gain.value = 1; // starts fully open; controlled by crossfader
+
+    const mediaStreamDest = ctx.createMediaStreamDestination();
+    mediaStreamDestRef.current = mediaStreamDest;
+
     source
       .connect(gain)
       .connect(low)
       .connect(mid)
       .connect(high)
       .connect(sweep)
-      .connect(ctx.destination);
+      .connect(crossfadeGain);
 
-    nodesRef.current = { gain, low, mid, high, sweep };
+    // Connect to both speakers and the recording tap
+    crossfadeGain.connect(ctx.destination);
+    crossfadeGain.connect(mediaStreamDest);
+
+    nodesRef.current = { gain, low, mid, high, sweep, crossfadeGain };
 
     // ---- WaveSurfer (uses our audio element for transport + viz) ----
     const ws = WaveSurfer.create({
@@ -302,6 +316,10 @@ function useDeck(progressColor: string) {
     setVolumeState(val);
   }, []);
 
+  const setCrossfadeGain = useCallback((val: number) => {
+    if (nodesRef.current) nodesRef.current.crossfadeGain.gain.value = val;
+  }, []);
+
   const tapHotCue = useCallback(
     (index: number) => {
       const ws = wsRef.current;
@@ -338,7 +356,6 @@ function useDeck(progressColor: string) {
       setLooping(false);
     } else {
       const start = audio.currentTime;
-      // 8 bars based on BPM, fallback to 8s
       const bars = bpmRef.current ? (32 / bpmRef.current) * 60 : 8;
       loopStartRef.current = start;
       loopEndRef.current = start + bars;
@@ -347,14 +364,38 @@ function useDeck(progressColor: string) {
     }
   }, []);
 
+  const [playbackRate, setPlaybackRateState] = useState(1.0);
+
+  const setTempo = useCallback((rate: number) => {
+    if (audioRef.current) audioRef.current.playbackRate = rate;
+    setPlaybackRateState(rate);
+  }, []);
+
+  const resetTempo = useCallback(() => {
+    if (audioRef.current) audioRef.current.playbackRate = 1.0;
+    setPlaybackRateState(1.0);
+  }, []);
+
+  // Effective BPM accounts for playback rate
+  const effectiveBpm = bpm != null ? Math.round(bpm * playbackRate * 10) / 10 : null;
+
+  const getMediaStream = useCallback(
+    () => mediaStreamDestRef.current?.stream ?? null,
+    []
+  );
+
   return {
     containerRef, wsRef,
-    track, isPlaying, bpm, setBpm,
+    track, isPlaying, bpm: effectiveBpm, rawBpm: bpm, setBpm,
     eqLow, eqMid, eqHigh, filterVal, volume,
     hotCues, looping,
+    playbackRate,
     loadTrack, togglePlay,
     setLow, setMid, setHigh, setFilter, setVolume,
     tapHotCue, clearHotCue, toggleLoop,
+    setTempo, resetTempo,
+    getMediaStream,
+    setCrossfadeGain,
   };
 }
 
@@ -377,6 +418,7 @@ function Deck({
     containerRef, track, isPlaying, bpm,
     eqLow, eqMid, eqHigh, filterVal, volume,
     hotCues, looping,
+    playbackRate, setTempo, resetTempo,
     togglePlay, setLow, setMid, setHigh, setFilter, setVolume,
     tapHotCue, clearHotCue, toggleLoop,
   } = deck;
@@ -508,6 +550,37 @@ function Deck({
           </span>
         </div>
       </div>
+
+      {/* Tempo */}
+      <div className="border-t border-zinc-800 pt-2">
+        <div className="flex justify-between items-center mb-1">
+          <span className="text-[9px] font-mono text-zinc-500">TEMPO</span>
+          <div className="flex items-center gap-1.5">
+            {bpm != null && (
+              <span className="text-[9px] font-mono text-zinc-400">{bpm.toFixed(1)} BPM</span>
+            )}
+            <button
+              onClick={resetTempo}
+              disabled={playbackRate === 1.0}
+              className="text-[9px] font-mono px-1.5 py-0.5 rounded bg-zinc-800 hover:bg-zinc-700 text-zinc-500 hover:text-zinc-300 disabled:opacity-30 transition-colors"
+            >
+              RST
+            </button>
+          </div>
+        </div>
+        <input
+          type="range" min="0.85" max="1.15" step="0.001" value={playbackRate}
+          onChange={(e) => setTempo(parseFloat(e.target.value))}
+          className="w-full"
+        />
+        <div className="flex justify-between mt-0.5">
+          <span className="text-[9px] text-zinc-700 font-mono">-15%</span>
+          <span className={`text-[9px] font-mono ${Math.abs(playbackRate - 1) < 0.002 ? "text-zinc-700" : "text-amber-400"}`}>
+            {playbackRate > 1 ? "+" : ""}{((playbackRate - 1) * 100).toFixed(1)}%
+          </span>
+          <span className="text-[9px] text-zinc-700 font-mono">+15%</span>
+        </div>
+      </div>
     </div>
   );
 }
@@ -545,6 +618,16 @@ export default function Home() {
   const [mixReady, setMixReady] = useState(false);
   const [mixing, setMixing] = useState(false);
   const [showMixIdeas, setShowMixIdeas] = useState(false);
+  const [blending, setBlending] = useState(false);
+  const [blendDuration, setBlendDuration] = useState(16);
+  const blendRAFRef = useRef<number | null>(null);
+  const blendStartRef = useRef<{ t: number; from: number; to: number } | null>(null);
+  const [recording, setRecording] = useState(false);
+  const [recSeconds, setRecSeconds] = useState(0);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const recChunksRef = useRef<Blob[]>([]);
+  const recMergeCtxRef = useRef<AudioContext | null>(null);
+  const recTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const [analyzingA, setAnalyzingA] = useState(false);
   const [analyzingB, setAnalyzingB] = useState(false);
   const [suggestions, setSuggestions] = useState<Suggestion[]>([]);
@@ -556,6 +639,13 @@ export default function Home() {
 
   const deckA = useDeck("#34d399");
   const deckB = useDeck("#a78bfa");
+
+  // Keep real-time crossfade gains in sync with the crossfader position
+  useEffect(() => {
+    const angle = crossfader * Math.PI / 2;
+    deckA.setCrossfadeGain(Math.cos(angle));
+    deckB.setCrossfadeGain(Math.sin(angle));
+  }, [crossfader]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Poll track library
   const fetchTracks = useCallback(async () => {
@@ -606,6 +696,104 @@ export default function Home() {
     }, 1500);
     setTimeout(fetchTracks, 8000);
   }, [fetchTracks]);
+
+  const startBlend = useCallback(() => {
+    const target = crossfader < 0.5 ? 1 : 0;
+    blendStartRef.current = { t: performance.now(), from: crossfader, to: target };
+    setBlending(true);
+
+    const animate = () => {
+      if (!blendStartRef.current) return;
+      const progress = Math.min((performance.now() - blendStartRef.current.t) / 1000 / blendDuration, 1);
+      // Ease-in-out (smooth start + smooth landing)
+      const eased = progress < 0.5 ? 2 * progress * progress : -1 + (4 - 2 * progress) * progress;
+      const next = blendStartRef.current.from + (blendStartRef.current.to - blendStartRef.current.from) * eased;
+      setCrossfader(next);
+      setMixReady(false);
+
+      if (progress < 1) {
+        blendRAFRef.current = requestAnimationFrame(animate);
+      } else {
+        setCrossfader(blendStartRef.current.to); // snap to exact target
+        blendStartRef.current = null;
+        setBlending(false);
+      }
+    };
+    blendRAFRef.current = requestAnimationFrame(animate);
+  }, [crossfader, blendDuration]);
+
+  const cancelBlend = useCallback(() => {
+    if (blendRAFRef.current) cancelAnimationFrame(blendRAFRef.current);
+    blendRAFRef.current = null;
+    blendStartRef.current = null;
+    setBlending(false);
+  }, []);
+
+  const startRecording = useCallback(() => {
+    const streamA = deckA.getMediaStream();
+    const streamB = deckB.getMediaStream();
+    if (!streamA && !streamB) return;
+
+    // Merge both deck streams into a single AudioContext
+    const mergeCtx = new AudioContext();
+    recMergeCtxRef.current = mergeCtx;
+    const mergeDest = mergeCtx.createMediaStreamDestination();
+    if (streamA) mergeCtx.createMediaStreamSource(streamA).connect(mergeDest);
+    if (streamB) mergeCtx.createMediaStreamSource(streamB).connect(mergeDest);
+
+    const mimeType = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
+      ? "audio/webm;codecs=opus"
+      : MediaRecorder.isTypeSupported("audio/ogg;codecs=opus")
+      ? "audio/ogg;codecs=opus"
+      : "";
+
+    const recorder = new MediaRecorder(mergeDest.stream, mimeType ? { mimeType } : {});
+    recChunksRef.current = [];
+
+    recorder.ondataavailable = (e) => {
+      if (e.data.size > 0) recChunksRef.current.push(e.data);
+    };
+
+    recorder.onstop = async () => {
+      const blob = new Blob(recChunksRef.current, { type: recorder.mimeType });
+      const ext = recorder.mimeType.includes("ogg") ? "ogg"
+        : recorder.mimeType.includes("mp4") ? "m4a" : "webm";
+      const filename = `recording-${Date.now()}.${ext}`;
+      const saved = await outputDir.saveFile(blob, filename);
+      if (!saved) {
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url; a.download = filename; a.click();
+        URL.revokeObjectURL(url);
+      }
+      recMergeCtxRef.current?.close();
+      recMergeCtxRef.current = null;
+    };
+
+    recorder.start();
+    mediaRecorderRef.current = recorder;
+    setRecSeconds(0);
+    recTimerRef.current = setInterval(() => setRecSeconds((s) => s + 1), 1000);
+    setRecording(true);
+  }, [deckA, deckB, outputDir]);
+
+  const stopRecording = useCallback(() => {
+    mediaRecorderRef.current?.stop();
+    mediaRecorderRef.current = null;
+    if (recTimerRef.current) { clearInterval(recTimerRef.current); recTimerRef.current = null; }
+    setRecording(false);
+    setRecSeconds(0);
+  }, []);
+
+  // Match one deck's tempo to the other's base BPM
+  // reference = the deck that stays fixed; the other deck's playbackRate is adjusted
+  const matchBpm = useCallback((reference: "A" | "B") => {
+    const ref = reference === "A" ? deckA : deckB;
+    const adj = reference === "A" ? deckB : deckA;
+    if (!ref.rawBpm || !adj.rawBpm) return;
+    const newRate = ref.rawBpm / adj.rawBpm;
+    adj.setTempo(Math.max(0.85, Math.min(1.15, newRate)));
+  }, [deckA, deckB]);
 
   const analyzeBpm = useCallback(
     async (deck: "A" | "B") => {
@@ -881,7 +1069,7 @@ export default function Home() {
             <Deck label="DECK A" accentClass="text-emerald-400" deck={deckA} />
 
             {/* Center column */}
-            <div className="w-24 flex flex-col items-center justify-center gap-3 shrink-0">
+            <div className="w-24 flex flex-col items-center justify-center gap-2 shrink-0">
               <button
                 onClick={() => analyzeBpm("A")}
                 disabled={!deckA.track || analyzingA}
@@ -889,6 +1077,25 @@ export default function Home() {
               >
                 {analyzingA ? "..." : "BPM A"}
               </button>
+              {/* Match BPM buttons */}
+              <div className="flex flex-col gap-1 w-full">
+                <button
+                  onClick={() => matchBpm("A")}
+                  disabled={!deckA.rawBpm || !deckB.rawBpm}
+                  title="Set deck B tempo to match deck A"
+                  className="w-full py-1 rounded-lg bg-zinc-800 hover:bg-emerald-900/50 disabled:opacity-30 text-emerald-400 text-[9px] font-mono transition-colors"
+                >
+                  B←A
+                </button>
+                <button
+                  onClick={() => matchBpm("B")}
+                  disabled={!deckA.rawBpm || !deckB.rawBpm}
+                  title="Set deck A tempo to match deck B"
+                  className="w-full py-1 rounded-lg bg-zinc-800 hover:bg-violet-900/50 disabled:opacity-30 text-violet-400 text-[9px] font-mono transition-colors"
+                >
+                  A←B
+                </button>
+              </div>
               <button
                 onClick={handleSync}
                 disabled={mixing || !deckA.track || !deckB.track}
@@ -912,18 +1119,80 @@ export default function Home() {
             <Deck label="DECK B" accentClass="text-violet-400" deck={deckB} />
           </div>
 
-          {/* Crossfader */}
+          {/* Crossfader + Record */}
           <div className="crossfader px-5 py-3 border-t border-zinc-800 shrink-0 bg-zinc-900/40">
             <div className="flex items-center gap-4">
               <span className="text-xs font-mono text-emerald-400 shrink-0">A</span>
               <input
                 type="range" min="0" max="1" step="0.01" value={crossfader}
-                onChange={(e) => { setCrossfader(parseFloat(e.target.value)); setMixReady(false); }}
+                onChange={(e) => {
+                  cancelBlend();
+                  setCrossfader(parseFloat(e.target.value));
+                  setMixReady(false);
+                }}
                 className="flex-1"
               />
               <span className="text-xs font-mono text-violet-400 shrink-0">B</span>
             </div>
-            <p className="text-center text-[9px] font-mono text-zinc-700 mt-1 tracking-widest">CROSSFADER</p>
+
+            {/* Blend controls row */}
+            <div className="flex items-center justify-center gap-2 mt-1.5">
+              {blending ? (
+                <button
+                  onClick={cancelBlend}
+                  className="px-3 py-1 rounded-lg bg-amber-900/50 hover:bg-amber-800/50 text-amber-400 text-[10px] font-mono tracking-widest transition-colors"
+                >
+                  CANCEL BLEND
+                </button>
+              ) : (
+                <>
+                  <button
+                    onClick={startBlend}
+                    disabled={!deckA.track || !deckB.track}
+                    className="px-3 py-1 rounded-lg bg-zinc-800 hover:bg-zinc-700 disabled:opacity-30 text-zinc-300 text-[10px] font-mono tracking-widest transition-colors"
+                  >
+                    {crossfader < 0.5 ? "AUTO BLEND →B" : "A← AUTO BLEND"}
+                  </button>
+                  <select
+                    value={blendDuration}
+                    onChange={(e) => setBlendDuration(Number(e.target.value))}
+                    className="bg-zinc-800 border border-zinc-700 rounded text-[9px] font-mono text-zinc-400 px-1.5 py-1 outline-none"
+                  >
+                    <option value={8}>8s</option>
+                    <option value={16}>16s</option>
+                    <option value={32}>32s</option>
+                  </select>
+                </>
+              )}
+              <span className="text-[9px] font-mono text-zinc-700 tracking-widest">CROSSFADER</span>
+            </div>
+
+            {/* Record controls */}
+            <div className="flex items-center justify-center gap-3 mt-2">
+              {!recording ? (
+                <button
+                  onClick={startRecording}
+                  disabled={!deckA.track && !deckB.track}
+                  className="flex items-center gap-1.5 px-4 py-1.5 rounded-lg bg-zinc-800 hover:bg-red-900/50 disabled:opacity-30 text-zinc-400 hover:text-red-400 text-[10px] font-mono tracking-widest transition-colors"
+                >
+                  <span className="w-1.5 h-1.5 rounded-full bg-current" />
+                  REC
+                </button>
+              ) : (
+                <button
+                  onClick={stopRecording}
+                  className="flex items-center gap-1.5 px-4 py-1.5 rounded-lg bg-red-900/60 hover:bg-red-800/60 text-red-400 text-[10px] font-mono tracking-widest transition-colors"
+                >
+                  <span className="w-1.5 h-1.5 rounded bg-red-400 animate-pulse" />
+                  {`STOP  ${String(Math.floor(recSeconds / 60)).padStart(2, "0")}:${String(recSeconds % 60).padStart(2, "0")}`}
+                </button>
+              )}
+              {recording && (
+                <span className="text-[9px] font-mono text-zinc-600">
+                  saving to {outputDir.dirName ?? "Downloads"}
+                </span>
+              )}
+            </div>
           </div>
         </div>
       </div>

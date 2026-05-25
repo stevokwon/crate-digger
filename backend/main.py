@@ -1,10 +1,12 @@
 import asyncio
 import os
+import re
+import time
 from pathlib import Path
 
-from fastapi import BackgroundTasks, FastAPI, HTTPException
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
 from ingest_worker import LIBRARY_DIR, ingest_url
@@ -114,19 +116,22 @@ async def create_mix(req: MixRequest):
             b_path = time_stretch_to_bpm(b_path, bpm_b, req.target_bpm)
             tmp_files.append(b_path)
 
-    mix_path = mix_tracks(a_path, b_path, req.crossfader, req.eq_bass_a, req.eq_bass_b)
+    tmp_mix = mix_tracks(a_path, b_path, req.crossfader, req.eq_bass_a, req.eq_bass_b)
+
+    ts = int(time.time())
+    mix_name = f"mix-{req.deck_a[:12]}-{req.deck_b[:12]}-{ts}.wav"
 
     def _cleanup():
-        for f in [*tmp_files, mix_path]:
+        for f in [*tmp_files, tmp_mix]:
             try:
                 os.unlink(f)
             except OSError:
                 pass
 
     return FileResponse(
-        mix_path,
+        str(tmp_mix),
         media_type="audio/wav",
-        filename="mix.wav",
+        filename=mix_name,
         background=BackgroundTasks([_cleanup]),
     )
 
@@ -150,9 +155,52 @@ async def suggestions_endpoint():
     return {"suggestions": result}
 
 
+
 @app.get("/api/audio/{filename}")
-async def serve_audio(filename: str):
+async def serve_audio(filename: str, request: Request):
     filepath = LIBRARY_DIR / filename
     if not filepath.exists():
         raise HTTPException(status_code=404, detail="Audio file not found")
-    return FileResponse(str(filepath))
+
+    file_size = filepath.stat().st_size
+    media_type = "audio/mpeg" if filename.lower().endswith(".mp3") else "audio/wav"
+    range_header = request.headers.get("Range")
+
+    if range_header:
+        match = re.match(r"bytes=(\d+)-(\d*)", range_header)
+        if match:
+            start = int(match.group(1))
+            end = int(match.group(2)) if match.group(2) else file_size - 1
+            end = min(end, file_size - 1)
+            chunk_size = end - start + 1
+            with open(filepath, "rb") as f:
+                f.seek(start)
+                data = f.read(chunk_size)
+            return Response(
+                content=data,
+                status_code=206,
+                media_type=media_type,
+                headers={
+                    "Content-Range": f"bytes {start}-{end}/{file_size}",
+                    "Accept-Ranges": "bytes",
+                    "Content-Length": str(chunk_size),
+                },
+            )
+
+    # Full file — stream in chunks to avoid Content-Length race with large files
+    async def _stream():
+        with open(filepath, "rb") as f:
+            while True:
+                chunk = f.read(65536)
+                if not chunk:
+                    break
+                yield chunk
+
+    return StreamingResponse(
+        _stream(),
+        media_type=media_type,
+        headers={
+            "Accept-Ranges": "bytes",
+            "Content-Length": str(file_size),
+        },
+    )

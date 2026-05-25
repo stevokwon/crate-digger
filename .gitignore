@@ -217,8 +217,15 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
-# Crate Digger — local audio library
+# Crate Digger — local audio library and mixes
 backend/library/
+backend/mixes/
 backend/suggestions_cache.json
 frontend/node_modules/
 frontend/.next/
+
+# AI agent prompt files — kept private
+CLAUDE.md
+SKILL.md
+dj-architect.md
+.claude/
