@@ -15,10 +15,10 @@ from suggestions import get_suggestions
 
 app = FastAPI(title="Crate Digger API")
 
-_cors_origins = os.environ.get("CORS_ORIGINS", "http://localhost:3000").split(",")
+_cors_origins = os.environ.get("CORS_ORIGINS", "*")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[o.strip() for o in _cors_origins],
+    allow_origins=["*"] if _cors_origins == "*" else [o.strip() for o in _cors_origins.split(",")],
     allow_methods=["*"],
     allow_headers=["*"],
 )
